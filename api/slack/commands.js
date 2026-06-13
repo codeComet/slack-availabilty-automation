@@ -1,37 +1,33 @@
-const express = require('express')
-const { verifySlack } = require('../../src/middleware/verifySlack')
+const crypto = require('crypto')
 const { findOrCreateUser } = require('../../src/services/userService')
-const { updateStatus, clearStatus, postAvailabilityMessage, sendDirectMessage } = require('../../src/services/slackService')
+const { updateStatus, clearStatus, postAvailabilityMessage } = require('../../src/services/slackService')
 const { parseCommand } = require('../../src/utils/parseCommand')
 const supabase = require('../../src/lib/supabase')
 
-// Vercel serverless function.
-// Handles POST /api/slack/commands
+// Tell Vercel NOT to parse the body automatically.
+// We need the raw bytes to verify Slack's request signature.
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  // Ensure raw body is available for signature verification
-  // (On Vercel, req.body may already be a Buffer or string depending on Content-Type)
-  const rawBody = req.body instanceof Buffer ? req.body : Buffer.from(req.body || '')
+  // Collect raw body from the stream
+  const rawBody = await readRawBody(req)
 
-  // Verify Slack signature synchronously before anything else
-  const fakeReq = { headers: req.headers, body: rawBody }
-  const fakeRes = {
-    status: (code) => ({ json: (data) => res.status(code).json(data) }),
+  // Verify Slack signature — reject immediately if invalid
+  const verifyError = verifySlackSignature(req.headers, rawBody)
+  if (verifyError) {
+    return res.status(403).json({ error: verifyError })
   }
-  let verifyPassed = false
-  await new Promise((resolve) => {
-    verifySlack(fakeReq, fakeRes, () => {
-      verifyPassed = true
-      resolve()
-    })
-  })
-  if (!verifyPassed) return  // verifySlack already sent the 403
 
   // Parse URL-encoded body
-  const params = new URLSearchParams(rawBody.toString())
+  const params = new URLSearchParams(rawBody)
   const commandText = params.get('text') || ''
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
@@ -44,6 +40,43 @@ module.exports = async function handler(req, res) {
   handleCommand({ commandText, slackUserId, slackWorkspaceId, responseUrl }).catch((err) => {
     console.error('Unhandled error in handleCommand:', err)
   })
+}
+
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+function verifySlackSignature(headers, rawBody) {
+  const timestamp = headers['x-slack-request-timestamp']
+  const signature = headers['x-slack-signature']
+
+  if (!timestamp || !signature) return 'Missing Slack signature headers'
+
+  // Reject requests older than 5 minutes
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  if (Math.abs(nowSeconds - parseInt(timestamp, 10)) > 300) return 'Request timestamp too old'
+
+  const baseString = `v0:${timestamp}:${rawBody}`
+  const hmac = crypto
+    .createHmac('sha256', process.env.SLACK_SIGNING_SECRET)
+    .update(baseString)
+    .digest('hex')
+  const expected = `v0=${hmac}`
+
+  try {
+    const a = Buffer.from(signature)
+    const b = Buffer.from(expected)
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return 'Invalid Slack signature'
+  } catch {
+    return 'Signature verification failed'
+  }
+
+  return null  // null = OK
 }
 
 async function handleCommand({ commandText, slackUserId, slackWorkspaceId, responseUrl }) {
@@ -63,12 +96,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, respo
       await postEphemeral(responseUrl, {
         text: `You need to connect your Slack account before using \`/availability\`.\n<${connectUrl}|Click here to connect your account>.`,
       })
-      await logAvailability({
-        userId: user.id,
-        rawCommand: commandText,
-        success: false,
-        errorMessage: 'no_user_token',
-      })
+      await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'no_user_token' })
       return
     }
 
@@ -77,12 +105,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, respo
 
     if (parsed.action === 'error') {
       await postEphemeral(responseUrl, { text: parsed.errorMessage })
-      await logAvailability({
-        userId: user.id,
-        rawCommand: commandText,
-        success: false,
-        errorMessage: 'parse_error',
-      })
+      await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'parse_error' })
       return
     }
 
@@ -115,8 +138,8 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, respo
     if (channelPostError) {
       await postEphemeral(responseUrl, {
         text:
-          `Your Slack status was updated, but posting to \`#availability\` failed.\n` +
-          `Make sure the bot is invited to \`#availability\` (type \`/invite @Availability Bot\` in the channel).`,
+          'Your Slack status was updated, but posting to `#availability` failed.\n' +
+          'Make sure the bot is invited to `#availability`.',
       })
     } else if (parsed.action === 'clear') {
       await postEphemeral(responseUrl, { text: 'Your Slack status has been cleared.' })
@@ -125,7 +148,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, respo
         'Your availability has been updated.',
         `Status: ${parsed.statusText}${parsed.durationMinutes ? ` for ${formatDuration(parsed.durationMinutes)}` : ''}`,
         parsed.humanReadable ? `Expected back: ${parsed.humanReadable}` : null,
-        `Posted in: #availability`,
+        'Posted in: #availability',
       ].filter(Boolean)
       await postEphemeral(responseUrl, { text: lines.join('\n') })
     }
@@ -160,9 +183,7 @@ async function postEphemeral(responseUrl, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ response_type: 'ephemeral', ...body }),
   })
-  if (!response.ok) {
-    throw new Error(`Failed to post to response_url: ${response.status}`)
-  }
+  if (!response.ok) throw new Error(`Failed to post to response_url: ${response.status}`)
 }
 
 async function logAvailability({
