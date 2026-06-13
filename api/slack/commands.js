@@ -32,8 +32,6 @@ module.exports = async function handler(req, res) {
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
 
-  // Process the command and respond — all within Slack's 3-second window.
-  // handleCommand returns either a string (plain text) or { blocks: [...] }
   const result = await handleCommand({ commandText, slackUserId, slackWorkspaceId })
 
   const payload = typeof result === 'string'
@@ -51,10 +49,10 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
   let errorMessage = null
 
   try {
-    // 1. Find or create user
+    // 1. Find or create user in the source workspace
     user = await findOrCreateUser({ slackUserId, slackWorkspaceId })
 
-    // 2. Check for user token
+    // 2. Check for user token (source workspace connection)
     if (!user.user_token) {
       const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
       await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'no_user_token' })
@@ -69,7 +67,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
       return parsed.errorMessage
     }
 
-    // 4. Update Slack status
+    // 4. Update Slack status in the source workspace
     if (parsed.action === 'clear') {
       await clearStatus(user.user_token)
     } else {
@@ -80,7 +78,14 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
       })
     }
 
-    // 5. Post to #availability channel
+    // 5. Sync to all other connected workspaces (Phase 2)
+    const syncResults = await syncToOtherWorkspaces({
+      email: user.email,
+      sourceWorkspaceId: slackWorkspaceId,
+      parsed,
+    })
+
+    // 6. Post to #availability channel (Strativ source of truth)
     let channelPostError = null
     try {
       channelTs = await postAvailabilityMessage({
@@ -94,24 +99,8 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
       console.error('Failed to post to #availability:', err.message)
     }
 
-    // 6. Build confirmation message
-    if (channelPostError) {
-      return (
-        'Your Slack status was updated, but posting to `#availability` failed.\n' +
-        'Make sure the bot is invited to `#availability`.'
-      )
-    }
-
-    if (parsed.action === 'clear') {
-      return 'Your Slack status has been cleared.'
-    }
-
-    return [
-      'Your availability has been updated.',
-      `Status: ${parsed.statusText}${parsed.durationMinutes ? ` for ${formatDuration(parsed.durationMinutes)}` : ''}`,
-      parsed.humanReadable ? `Expected back: ${parsed.humanReadable}` : null,
-      'Posted in: #availability',
-    ].filter(Boolean).join('\n')
+    // 7. Build confirmation message
+    return buildConfirmationMessage({ parsed, syncResults, channelPostError, user, slackWorkspaceId })
 
   } catch (err) {
     hasError = true
@@ -119,7 +108,6 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
     console.error('Error handling /availability command:', err)
     return 'Something went wrong updating your availability. Please try again.'
   } finally {
-    // Always log, regardless of outcome
     await logAvailability({
       userId: user?.id ?? null,
       rawCommand: commandText,
@@ -133,6 +121,96 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
     })
   }
 }
+
+/**
+ * Looks up all workspace_connections for this user (by email),
+ * excluding the workspace they just ran the command from,
+ * and updates their status in each.
+ *
+ * @returns {{ workspaceName: string, success: boolean, error?: string }[]}
+ */
+async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
+  if (!email) {
+    console.warn('No email for user — cannot sync to other workspaces')
+    return []
+  }
+
+  const { data: connections, error } = await supabase
+    .from('workspace_connections')
+    .select('workspace_id, workspace_name, access_token')
+    .eq('user_email', email)
+    .neq('workspace_id', sourceWorkspaceId)   // skip the workspace the command came from
+
+  if (error) {
+    console.error('Failed to fetch workspace connections:', error.message)
+    return []
+  }
+
+  if (!connections || connections.length === 0) return []
+
+  const results = await Promise.allSettled(
+    connections.map(async (conn) => {
+      if (parsed.action === 'clear') {
+        await clearStatus(conn.access_token)
+      } else {
+        await updateStatus(conn.access_token, {
+          statusText: parsed.statusText,
+          emoji: parsed.emoji,
+          expiresUnix: parsed.expiresUnix,
+        })
+      }
+      return conn.workspace_name || conn.workspace_id
+    })
+  )
+
+  return results.map((result, i) => {
+    const conn = connections[i]
+    if (result.status === 'fulfilled') {
+      return { workspaceName: conn.workspace_name || conn.workspace_id, success: true }
+    } else {
+      console.error(`Failed to sync to ${conn.workspace_name}:`, result.reason?.message)
+      return { workspaceName: conn.workspace_name || conn.workspace_id, success: false, error: result.reason?.message }
+    }
+  })
+}
+
+function buildConfirmationMessage({ parsed, syncResults, channelPostError, user, slackWorkspaceId }) {
+  const lines = []
+
+  if (parsed.action === 'clear') {
+    lines.push('Your Slack status has been cleared.')
+  } else {
+    lines.push('Your availability has been updated.')
+    lines.push(`Status: ${parsed.statusText}${parsed.durationMinutes ? ` for ${formatDuration(parsed.durationMinutes)}` : ''}`)
+    if (parsed.humanReadable) lines.push(`Expected back: ${parsed.humanReadable}`)
+  }
+
+  // Sync results
+  if (syncResults.length > 0) {
+    const succeeded = syncResults.filter(r => r.success).map(r => r.workspaceName)
+    const failed = syncResults.filter(r => !r.success).map(r => r.workspaceName)
+
+    if (succeeded.length > 0) {
+      lines.push(`Synced to: ${succeeded.join(', ')}`)
+    }
+    if (failed.length > 0) {
+      lines.push(`⚠️ Sync failed for: ${failed.join(', ')} — reconnect at ${process.env.APP_URL}/api/connect`)
+    }
+  } else if (!syncResults.length && user.email) {
+    // User has email but no other workspaces connected
+    lines.push(`💡 Connect more workspaces at ${process.env.APP_URL}/api/connect`)
+  }
+
+  if (channelPostError) {
+    lines.push('⚠️ Could not post to `#availability` — make sure the bot is invited.')
+  } else if (parsed.action !== 'clear') {
+    lines.push('Posted in: #availability')
+  }
+
+  return lines.join('\n')
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
