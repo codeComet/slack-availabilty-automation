@@ -56,7 +56,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
 
     // 2. Check for user token
     if (!user.user_token) {
-      const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}`
+      const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
       await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'no_user_token' })
       return { blocks: buildConnectBlocks(connectUrl) }
     }
