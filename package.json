@@ -1,0 +1,21 @@
+{
+  "name": "slack-availability",
+  "version": "1.0.0",
+  "description": "Slack slash command app for syncing availability across workspaces",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.0.0",
+    "@supabase/supabase-js": "^2.0.0",
+    "express": "^4.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
