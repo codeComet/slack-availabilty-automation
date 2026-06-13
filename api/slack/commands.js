@@ -33,13 +33,14 @@ module.exports = async function handler(req, res) {
   const slackWorkspaceId = params.get('team_id')
 
   // Process the command and respond — all within Slack's 3-second window.
-  // We return the message directly in the HTTP response body (ephemeral).
-  const responseText = await handleCommand({ commandText, slackUserId, slackWorkspaceId })
+  // handleCommand returns either a string (plain text) or { blocks: [...] }
+  const result = await handleCommand({ commandText, slackUserId, slackWorkspaceId })
 
-  return res.status(200).json({
-    response_type: 'ephemeral',
-    text: responseText,
-  })
+  const payload = typeof result === 'string'
+    ? { response_type: 'ephemeral', text: result }
+    : { response_type: 'ephemeral', ...result }
+
+  return res.status(200).json(payload)
 }
 
 async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
@@ -57,7 +58,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
     if (!user.user_token) {
       const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}`
       await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'no_user_token' })
-      return `You need to connect your Slack account before using \`/availability\`.\n<${connectUrl}|Click here to connect your account>.`
+      return { blocks: buildConnectBlocks(connectUrl) }
     }
 
     // 3. Parse command
@@ -194,4 +195,27 @@ function formatDuration(minutes) {
   if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60} hour${minutes / 60 !== 1 ? 's' : ''}`
   if (minutes >= 60) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
   return `${minutes} minute${minutes !== 1 ? 's' : ''}`
+}
+
+function buildConnectBlocks(connectUrl) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '*One-time setup required*\nTo use `/availability`, connect your Slack account so the app can update your status.',
+      },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Connect account', emoji: true },
+          style: 'primary',
+          url: connectUrl,
+        },
+      ],
+    },
+  ]
 }
