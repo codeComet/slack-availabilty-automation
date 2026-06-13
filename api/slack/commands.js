@@ -203,19 +203,8 @@ function buildConnectBlocks(connectUrl) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: '*One-time setup required*\nTo use `/availability`, connect your Slack account so the app can update your status.',
+        text: `*One-time setup required*\nTo use \`/availability\`, you need to connect your Slack account so the app can update your status.\n\n<${connectUrl}|👉 Connect your account>`,
       },
-    },
-    {
-      type: 'actions',
-      elements: [
-        {
-          type: 'button',
-          text: { type: 'plain_text', text: 'Connect account', emoji: true },
-          style: 'primary',
-          url: connectUrl,
-        },
-      ],
     },
   ]
 }
