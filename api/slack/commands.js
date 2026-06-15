@@ -60,8 +60,8 @@ module.exports = async function handler(req, res) {
 
     if (responseUrl) {
       const payload = typeof result === 'string'
-        ? { response_type: 'ephemeral', replace_original: true, text: result }
-        : { response_type: 'ephemeral', replace_original: true, ...result }
+        ? { replace_original: true, text: result }
+        : { replace_original: true, ...result }
 
       await fetch(responseUrl, {
         method: 'POST',
@@ -76,7 +76,6 @@ module.exports = async function handler(req, res) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          response_type: 'ephemeral',
           replace_original: true,
           text: 'Something went wrong updating your availability. Please try again.',
         }),
