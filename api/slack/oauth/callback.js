@@ -1,8 +1,12 @@
 // GET /api/slack/oauth/callback?code=...&state=<base64-encoded-json>
-// Exchanges the OAuth code for a user token, fetches the user's email,
-// and stores the connection in workspace_connections keyed by email.
+// Exchanges the OAuth code for a user token and stores the workspace connection.
+//
+// Email lookup strategy (no users.profile:read required):
+//   1. If email is already in state (from /api/connect "add workspace" flow) → use it directly
+//   2. Otherwise use the bot token to call users.info → works for the source workspace where the bot lives
 
 const supabase = require('../../../src/lib/supabase')
+const { botClient } = require('../../../src/lib/slackClients')
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -52,31 +56,36 @@ module.exports = async function handler(req, res) {
 
   const userToken = tokenData.authed_user?.access_token
   const tokenScope = tokenData.authed_user?.scope
-  const slackUserIdInNewWorkspace = tokenData.authed_user?.id
+  const slackUserIdInWorkspace = tokenData.authed_user?.id
   const workspaceId = tokenData.team?.id
   const workspaceName = tokenData.team?.name
 
-  if (!userToken || !slackUserIdInNewWorkspace || !workspaceId) {
+  if (!userToken || !slackUserIdInWorkspace || !workspaceId) {
     return res.status(400).send('Incomplete token data from Slack. Please try again.')
   }
 
-  // Fetch the user's email from the newly connected workspace using their token
-  let email = null
-  try {
-    const profileRes = await fetch('https://slack.com/api/users.profile.get', {
-      headers: { Authorization: `Bearer ${userToken}` },
-    })
-    const profileData = await profileRes.json()
-    email = profileData.profile?.email || null
-  } catch (err) {
-    console.warn('Could not fetch profile email:', err.message)
+  // ── Resolve email ───────────────────────────────────────────────────────────
+  // Strategy 1: email was passed in state (from /api/connect "add workspace" flow)
+  let email = stateData.email || null
+
+  // Strategy 2: use the bot token to call users.info
+  // This works when the user is connecting the source workspace (where the bot lives).
+  // Does NOT need users.profile:read on the user token.
+  if (!email) {
+    try {
+      const info = await botClient.users.info({ user: slackUserIdInWorkspace })
+      email = info.user?.profile?.email || null
+    } catch (err) {
+      console.warn('Bot users.info lookup failed:', err.message)
+    }
   }
 
   if (!email) {
     return res.status(400).send(
-      'Could not retrieve your email from Slack. Make sure the app has users.profile:read scope.'
+      'Could not retrieve your email. Please contact your workspace admin or try reconnecting.'
     )
   }
+  // ───────────────────────────────────────────────────────────────────────────
 
   // Upsert into workspace_connections keyed by (email, workspace_id)
   try {
@@ -87,7 +96,7 @@ module.exports = async function handler(req, res) {
           user_email: email,
           workspace_id: workspaceId,
           workspace_name: workspaceName,
-          slack_user_id: slackUserIdInNewWorkspace,
+          slack_user_id: slackUserIdInWorkspace,
           access_token: userToken,
           token_scope: tokenScope,
           connected_at: new Date().toISOString(),
@@ -100,7 +109,6 @@ module.exports = async function handler(req, res) {
     return res.status(500).send('Connected to Slack, but failed to save. Please try again.')
   }
 
-  // Success
   res.status(200).send(`
     <!DOCTYPE html>
     <html>

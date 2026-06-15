@@ -1,5 +1,7 @@
 // GET /api/connect?email=bishal@strativ.se
 // Shows a user their connected workspaces and lets them add more.
+// The "add workspace" link encodes the email in OAuth state so the callback
+// doesn't need to fetch it from the user token (avoids scope issues).
 
 const supabase = require('../src/lib/supabase')
 
@@ -21,9 +23,13 @@ module.exports = async function handler(req, res) {
     connections = data || []
   }
 
-  // Build the "Add workspace" URL — no team forced, user picks in Slack
-  // We pass a dummy slack_user_id; the callback will resolve the real one from the token
-  const addUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=connect&team_id=`
+  // Encode email in state so the OAuth callback can use it directly
+  const addState = email
+    ? Buffer.from(JSON.stringify({ email })).toString('base64')
+    : ''
+  const addUrl = email
+    ? `${process.env.APP_URL}/api/slack/oauth/start?state=${addState}`
+    : `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=connect`
 
   const connectionsHtml = connections.length === 0
     ? '<p style="color:#888">No workspaces connected yet.</p>'
