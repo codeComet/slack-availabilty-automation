@@ -27,17 +27,101 @@ module.exports = async function handler(req, res) {
   const commandText = params.get('text') || ''
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
+  const responseUrl = params.get('response_url')
 
-  const result = await handleCommand({ commandText, slackUserId, slackWorkspaceId })
+  // ── Fast token lookup (must happen before we respond, so we can show
+  //    the connect button synchronously if needed) ────────────────────
+  const { userToken, userEmail } = await resolveUserToken(slackUserId, slackWorkspaceId)
 
-  const payload = typeof result === 'string'
-    ? { response_type: 'ephemeral', text: result }
-    : { response_type: 'ephemeral', ...result }
+  if (!userToken) {
+    const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
+    return res.status(200).json({
+      response_type: 'ephemeral',
+      blocks: buildConnectBlocks(connectUrl),
+    })
+  }
 
-  return res.status(200).json(payload)
+  // ── Acknowledge Slack immediately (within 3-second window) ─────────
+  // Status 200 with a placeholder so Slack doesn't show "operation_timeout".
+  // The real result is sent via response_url after the heavy work completes.
+  res.status(200).json({ response_type: 'ephemeral', text: '⏳ Updating your availability...' })
+
+  // ── Process asynchronously ─────────────────────────────────────────
+  // Vercel keeps the function alive until all awaited work completes
+  // (up to the maxDuration in vercel.json).
+  try {
+    const result = await handleCommand({
+      commandText,
+      slackUserId,
+      slackWorkspaceId,
+      userToken,
+      userEmail,
+    })
+
+    if (responseUrl) {
+      const payload = typeof result === 'string'
+        ? { response_type: 'ephemeral', replace_original: true, text: result }
+        : { response_type: 'ephemeral', replace_original: true, ...result }
+
+      await fetch(responseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(err => console.error('Failed to POST to response_url:', err.message))
+    }
+  } catch (err) {
+    console.error('Async command processing failed:', err)
+    if (responseUrl) {
+      await fetch(responseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          response_type: 'ephemeral',
+          replace_original: true,
+          text: 'Something went wrong updating your availability. Please try again.',
+        }),
+      }).catch(() => {})
+    }
+  }
 }
 
-async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
+/**
+ * Resolve the user's OAuth token for the source workspace.
+ *
+ * Strategy:
+ *   1. workspace_connections table (Phase 2 — preferred)
+ *   2. users.user_token (Phase 1 / pre-Phase2 connections — fallback)
+ *
+ * Returns { userToken, userEmail } — both may be null if not connected.
+ */
+async function resolveUserToken(slackUserId, slackWorkspaceId) {
+  // Phase 2: look up by (workspace_id, slack_user_id)
+  const { data: conn } = await supabase
+    .from('workspace_connections')
+    .select('access_token, user_email')
+    .eq('workspace_id', slackWorkspaceId)
+    .eq('slack_user_id', slackUserId)
+    .maybeSingle()
+
+  if (conn?.access_token) {
+    return { userToken: conn.access_token, userEmail: conn.user_email }
+  }
+
+  // Phase 1 fallback: old users table
+  const { data: userRow } = await supabase
+    .from('users')
+    .select('user_token, email')
+    .eq('slack_user_id', slackUserId)
+    .eq('slack_workspace_id', slackWorkspaceId)
+    .maybeSingle()
+
+  return {
+    userToken: userRow?.user_token || null,
+    userEmail: userRow?.email || null,
+  }
+}
+
+async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userToken, userEmail }) {
   let user = null
   let parsed = null
   let channelTs = null
@@ -45,37 +129,18 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
   let errorMessage = null
 
   try {
-    // 1. Find or create user (gets display name + email via bot token)
+    // Get display name (and email if not already known)
     user = await findOrCreateUser({ slackUserId, slackWorkspaceId })
+    const resolvedEmail = userEmail || user.email
 
-    // 2. Look up this user's token in workspace_connections for the SOURCE workspace.
-    //    Phase 2 stores all tokens there — not in users.user_token.
-    //    Look up by (workspace_id + slack_user_id) so email is not required.
-    const { data: sourceConn } = await supabase
-      .from('workspace_connections')
-      .select('access_token, user_email')
-      .eq('workspace_id', slackWorkspaceId)
-      .eq('slack_user_id', slackUserId)
-      .maybeSingle()
-
-    if (!sourceConn) {
-      const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
-      await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'no_user_token' })
-      return { blocks: buildConnectBlocks(connectUrl) }
-    }
-
-    const userToken = sourceConn.access_token
-    const userEmail = sourceConn.user_email || user.email
-
-    // 3. Parse command
+    // Parse command
     parsed = parseCommand(commandText)
-
     if (parsed.action === 'error') {
       await logAvailability({ userId: user.id, rawCommand: commandText, success: false, errorMessage: 'parse_error' })
       return parsed.errorMessage
     }
 
-    // 4. Update status in source workspace
+    // Update status in source workspace
     if (parsed.action === 'clear') {
       await clearStatus(userToken)
     } else {
@@ -86,14 +151,14 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
       })
     }
 
-    // 5. Sync to all other connected workspaces (Phase 2)
+    // Sync to other connected workspaces
     const syncResults = await syncToOtherWorkspaces({
-      email: userEmail,
+      email: resolvedEmail,
       sourceWorkspaceId: slackWorkspaceId,
       parsed,
     })
 
-    // 6. Post to #availability channel
+    // Post to #availability
     let channelPostError = null
     try {
       channelTs = await postAvailabilityMessage({
@@ -107,8 +172,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
       console.error('Failed to post to #availability:', err.message)
     }
 
-    // 7. Build confirmation
-    return buildConfirmationMessage({ parsed, syncResults, channelPostError, userEmail })
+    return buildConfirmationMessage({ parsed, syncResults, channelPostError, userEmail: resolvedEmail })
 
   } catch (err) {
     hasError = true
@@ -130,9 +194,6 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId }) {
   }
 }
 
-/**
- * Syncs status to all workspace_connections for this user except the source workspace.
- */
 async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
   if (!email) return []
 
@@ -146,8 +207,7 @@ async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
     console.error('Failed to fetch workspace connections:', error.message)
     return []
   }
-
-  if (!connections || connections.length === 0) return []
+  if (!connections?.length) return []
 
   const results = await Promise.allSettled(
     connections.map(async (conn) => {
@@ -170,7 +230,7 @@ async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
       return { workspaceName: conn.workspace_name || conn.workspace_id, success: true }
     }
     console.error(`Sync failed for ${conn.workspace_name}:`, result.reason?.message)
-    return { workspaceName: conn.workspace_name || conn.workspace_id, success: false, error: result.reason?.message }
+    return { workspaceName: conn.workspace_name || conn.workspace_id, success: false }
   })
 }
 
@@ -188,8 +248,8 @@ function buildConfirmationMessage({ parsed, syncResults, channelPostError, userE
   if (syncResults.length > 0) {
     const succeeded = syncResults.filter(r => r.success).map(r => r.workspaceName)
     const failed = syncResults.filter(r => !r.success).map(r => r.workspaceName)
-    if (succeeded.length > 0) lines.push(`Synced to: ${succeeded.join(', ')}`)
-    if (failed.length > 0) {
+    if (succeeded.length) lines.push(`Synced to: ${succeeded.join(', ')}`)
+    if (failed.length) {
       lines.push(`⚠️ Sync failed for: ${failed.join(', ')} — reconnect at ${process.env.APP_URL}/api/connect?email=${encodeURIComponent(userEmail || '')}`)
     }
   }
@@ -237,7 +297,6 @@ function verifySlackSignature(headers, rawBody) {
   } catch {
     return 'Signature verification failed'
   }
-
   return null
 }
 
