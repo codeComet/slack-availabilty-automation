@@ -27,10 +27,7 @@ module.exports = async function handler(req, res) {
   const commandText = params.get('text') || ''
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
-  const responseUrl = params.get('response_url')
 
-  // ── Fast token lookup (must happen before we respond, so we can show
-  //    the connect button synchronously if needed) ────────────────────
   const { userToken, userEmail } = await resolveUserToken(slackUserId, slackWorkspaceId)
 
   if (!userToken) {
@@ -41,14 +38,8 @@ module.exports = async function handler(req, res) {
     })
   }
 
-  // ── Acknowledge Slack immediately (within 3-second window) ─────────
-  // Status 200 with a placeholder so Slack doesn't show "operation_timeout".
-  // The real result is sent via response_url after the heavy work completes.
-  res.status(200).json({ response_type: 'ephemeral', text: '⏳ Updating your availability...' })
-
-  // ── Process asynchronously ─────────────────────────────────────────
-  // Vercel keeps the function alive until all awaited work completes
-  // (up to the maxDuration in vercel.json).
+  // Process everything synchronously and respond once with the final result.
+  // This avoids the unreliable replace_original / response_url pattern.
   try {
     const result = await handleCommand({
       commandText,
@@ -58,29 +49,17 @@ module.exports = async function handler(req, res) {
       userEmail,
     })
 
-    if (responseUrl) {
-      const payload = typeof result === 'string'
-        ? { replace_original: true, text: result }
-        : { replace_original: true, ...result }
+    const payload = typeof result === 'string'
+      ? { response_type: 'ephemeral', text: result }
+      : { response_type: 'ephemeral', ...result }
 
-      await fetch(responseUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(err => console.error('Failed to POST to response_url:', err.message))
-    }
+    return res.status(200).json(payload)
   } catch (err) {
-    console.error('Async command processing failed:', err)
-    if (responseUrl) {
-      await fetch(responseUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          replace_original: true,
-          text: 'Something went wrong updating your availability. Please try again.',
-        }),
-      }).catch(() => {})
-    }
+    console.error('Command processing failed:', err)
+    return res.status(200).json({
+      response_type: 'ephemeral',
+      text: 'Something went wrong updating your availability. Please try again.',
+    })
   }
 }
 
@@ -150,25 +129,30 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       })
     }
 
-    // Sync to other connected workspaces
-    const syncResults = await syncToOtherWorkspaces({
-      email: resolvedEmail,
-      sourceWorkspaceId: slackWorkspaceId,
-      parsed,
-    })
-
-    // Post to #availability
+    // Sync to other workspaces + post to #availability in parallel
+    let syncResults = []
     let channelPostError = null
-    try {
-      channelTs = await postAvailabilityMessage({
+    const [syncSettled, channelSettled] = await Promise.allSettled([
+      syncToOtherWorkspaces({ email: resolvedEmail, sourceWorkspaceId: slackWorkspaceId, parsed }),
+      postAvailabilityMessage({
         displayName: user.display_name || slackUserId,
         statusText: parsed.statusText,
         humanReadable: parsed.humanReadable,
         action: parsed.action,
-      })
-    } catch (err) {
-      channelPostError = err
-      console.error('Failed to post to #availability:', err.message)
+      }),
+    ])
+
+    if (syncSettled.status === 'fulfilled') {
+      syncResults = syncSettled.value
+    } else {
+      console.error('Sync failed:', syncSettled.reason?.message)
+    }
+
+    if (channelSettled.status === 'fulfilled') {
+      channelTs = channelSettled.value
+    } else {
+      channelPostError = channelSettled.reason
+      console.error('Failed to post to #availability:', channelSettled.reason?.message)
     }
 
     return buildConfirmationMessage({ parsed, syncResults, channelPostError, userEmail: resolvedEmail })
