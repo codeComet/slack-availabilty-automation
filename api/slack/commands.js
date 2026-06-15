@@ -178,6 +178,27 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
     hasError = true
     errorMessage = err.message
     console.error('Error handling /availability command:', err)
+
+    // Slack API token errors — tell the user to reconnect rather than showing a generic error
+    const slackTokenErrors = ['no_user_token', 'invalid_auth', 'token_revoked', 'account_inactive', 'token_expired']
+    if (slackTokenErrors.includes(err.data?.error || err.message)) {
+      // Clear the invalid token so the connect button appears on next command
+      await supabase.from('users').update({ user_token: null, token_scope: null }).eq('slack_user_id', slackUserId)
+      await supabase.from('workspace_connections').delete().eq('slack_user_id', slackUserId).eq('workspace_id', slackWorkspaceId)
+      const connectUrl = `${process.env.APP_URL}/api/slack/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
+      return {
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `*Your Slack token has expired or been revoked.*\nPlease reconnect your account to continue using \`/availability\`.\n\n<${connectUrl}|👉 Reconnect your account>`,
+            },
+          },
+        ],
+      }
+    }
+
     return 'Something went wrong updating your availability. Please try again.'
   } finally {
     await logAvailability({
