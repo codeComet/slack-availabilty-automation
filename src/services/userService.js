@@ -31,6 +31,31 @@ async function findOrCreateUser({ slackUserId, slackWorkspaceId }) {
     console.warn(`Could not fetch Slack user info for ${slackUserId}:`, err.message)
   }
 
+  // Check if user already exists with this email (e.g. migrated from another workspace)
+  if (email) {
+    const { data: byEmail } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle()
+
+    if (byEmail) {
+      // Update their primary workspace to the current one and return
+      const { data: updated } = await supabase
+        .from('users')
+        .update({
+          slack_user_id: slackUserId,
+          slack_workspace_id: slackWorkspaceId,
+          display_name: displayName,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('email', email)
+        .select()
+        .single()
+      return updated || byEmail
+    }
+  }
+
   const { data: created, error: insertError } = await supabase
     .from('users')
     .insert({
