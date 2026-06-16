@@ -32,15 +32,16 @@ async function clearStatus(userToken) {
  * @param {{ displayName: string, statusText: string, humanReadable: string | null, action: string }} params
  * @returns {Promise<string>}  Slack message timestamp (ts)
  */
-async function postAvailabilityMessage({ displayName, statusText, humanReadable, action }) {
+async function postAvailabilityMessage({ displayName, statusText, channelPhrase, humanReadable, action }) {
   let text
+  const phrase = channelPhrase || `is ${statusText.toLowerCase()}`
 
   if (action === 'clear') {
     text = `${displayName} is available again.`
   } else if (humanReadable) {
-    text = `${displayName} is ${statusText.toLowerCase()}.\nExpected back: ${humanReadable}.`
+    text = `${displayName} ${phrase}. Expected to be back at: ${humanReadable}.`
   } else {
-    text = `${displayName} is ${statusText.toLowerCase()}.`
+    text = `${displayName} ${phrase}.`
   }
 
   const result = await botClient.chat.postMessage({

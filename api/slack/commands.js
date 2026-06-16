@@ -137,6 +137,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       postAvailabilityMessage({
         displayName: user.display_name || slackUserId,
         statusText: parsed.statusText,
+        channelPhrase: parsed.channelPhrase,
         humanReadable: parsed.humanReadable,
         action: parsed.action,
       }),
@@ -246,7 +247,7 @@ function buildConfirmationMessage({ parsed, syncResults, channelPostError, userE
   } else {
     lines.push('Your availability has been updated.')
     lines.push(`Status: ${parsed.statusText}${parsed.durationMinutes ? ` for ${formatDuration(parsed.durationMinutes)}` : ''}`)
-    if (parsed.humanReadable) lines.push(`Expected back: ${parsed.humanReadable}`)
+    if (parsed.humanReadable) lines.push(`Expected to be back at: ${parsed.humanReadable}`)
   }
 
   if (syncResults.length > 0) {

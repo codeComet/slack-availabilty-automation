@@ -48,6 +48,7 @@ function parseCommand(rawText) {
     action: 'set',
     statusText: preset.text,
     emoji: preset.emoji,
+    channelPhrase: preset.channelPhrase,
     ...duration,
   }
 }
