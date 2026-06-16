@@ -34,7 +34,7 @@ async function clearStatus(userToken) {
  */
 async function postAvailabilityMessage({ displayName, statusText, channelPhrase, humanReadable, action }) {
   let text
-  const phrase = channelPhrase || `is ${statusText.toLowerCase()}`
+  const phrase = channelPhrase || (statusText ? `is ${statusText.toLowerCase()}` : '')
 
   if (action === 'clear') {
     text = `${displayName} is available again.`
