@@ -1,7 +1,7 @@
 // Parses a duration string into minutes, an expiry Date, a Unix timestamp, and a human-readable time.
-// All human-readable times use Europe/Stockholm timezone.
+// All human-readable times use Asia/Dhaka timezone (GMT+6).
 
-const TIMEZONE = 'Europe/Stockholm'
+const TIMEZONE = 'Asia/Dhaka'
 
 /**
  * @param {string} input  e.g. "1h", "30m", "today", "at 4pm", "until 4:30pm", ""
@@ -70,7 +70,7 @@ function endOfTodayInStockholm() {
   // Get today's date string in Stockholm time, then set time to 23:59
   const nowInStockholm = new Date().toLocaleDateString('sv-SE', { timeZone: TIMEZONE })
   // nowInStockholm is "YYYY-MM-DD"
-  return new Date(`${nowInStockholm}T23:59:00+01:00`)
+  return new Date(`${nowInStockholm}T23:59:00+06:00`)
 }
 
 function parseTodayAtTime(timeStr) {
@@ -85,7 +85,7 @@ function parseTodayAtTime(timeStr) {
     const meridiem = twelveHour[3]
     if (meridiem === 'pm' && hours < 12) hours += 12
     if (meridiem === 'am' && hours === 12) hours = 0
-    return new Date(`${todayInStockholm}T${pad(hours)}:${pad(minutes)}:00+01:00`)
+    return new Date(`${todayInStockholm}T${pad(hours)}:${pad(minutes)}:00+06:00`)
   }
 
   // Try 24-hour: "16:00", "16"
@@ -93,7 +93,7 @@ function parseTodayAtTime(timeStr) {
   if (twentyFourHour) {
     const hours = parseInt(twentyFourHour[1], 10)
     const minutes = parseInt(twentyFourHour[2] || '0', 10)
-    return new Date(`${todayInStockholm}T${pad(hours)}:${pad(minutes)}:00+01:00`)
+    return new Date(`${todayInStockholm}T${pad(hours)}:${pad(minutes)}:00+06:00`)
   }
 
   return null
