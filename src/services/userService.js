@@ -19,16 +19,16 @@ async function findOrCreateUser({ slackUserId, slackWorkspaceId }) {
 
   if (selectError) throw selectError
   if (existing) {
-    // Backfill avatar_url if missing (for users created before this column existed)
+    // Backfill avatar_url if missing — fire-and-forget so it never blocks the command response
     if (!existing.avatar_url) {
-      try {
-        const info = await botClient.users.info({ user: slackUserId })
-        const avatarUrl = info.user?.profile?.image_72 || null
-        if (avatarUrl) {
-          await supabase.from('users').update({ avatar_url: avatarUrl }).eq('id', existing.id)
-          existing.avatar_url = avatarUrl
-        }
-      } catch (_) {}
+      botClient.users.info({ user: slackUserId })
+        .then(info => {
+          const avatarUrl = info.user?.profile?.image_72 || null
+          if (avatarUrl) {
+            supabase.from('users').update({ avatar_url: avatarUrl }).eq('id', existing.id).then(() => {})
+          }
+        })
+        .catch(() => {})
     }
     return existing
   }
