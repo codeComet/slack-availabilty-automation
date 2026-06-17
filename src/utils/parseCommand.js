@@ -4,9 +4,19 @@ const { parseDuration } = require('./parseDuration')
 /**
  * Parses the raw text from a /availability slash command.
  *
- * @param {string} rawText  Everything after "/availability", e.g. "unavailable 1h"
+ * Supports an optional trailing "post" keyword that controls whether the status
+ * is announced in #availability. Without it, only the Slack status is updated.
+ *
+ * Examples:
+ *   /availability lunch 1h        → updates status, no channel post
+ *   /availability lunch 1h post   → updates status + posts to #availability
+ *   /availability clear           → clears status (channel post based on prior entry)
+ *   /availability clear post      → forces a channel post on clear
+ *
+ * @param {string} rawText  Everything after "/availability", e.g. "unavailable 1h post"
  * @returns {{
  *   action: 'set' | 'clear' | 'error',
+ *   shouldPost: boolean,
  *   statusText?: string,
  *   emoji?: string,
  *   durationMinutes?: number | null,
@@ -17,17 +27,24 @@ const { parseDuration } = require('./parseDuration')
  * }}
  */
 function parseCommand(rawText) {
-  const input = (rawText || '').trim().toLowerCase()
+  let input = (rawText || '').trim().toLowerCase()
 
   if (!input) {
     return {
       action: 'error',
+      shouldPost: false,
       errorMessage: buildHelpText(),
     }
   }
 
+  // Detect and strip the optional trailing 'post' flag
+  const shouldPost = input === 'post' || input.endsWith(' post')
+  if (shouldPost) {
+    input = input.slice(0, -4).trim() // remove trailing 'post'
+  }
+
   if (input === 'clear') {
-    return { action: 'clear' }
+    return { action: 'clear', shouldPost }
   }
 
   // Match against preset keywords (longest first, guaranteed by PRESET_KEYS order in presets.js)
@@ -36,6 +53,7 @@ function parseCommand(rawText) {
   if (!matchedKey) {
     return {
       action: 'error',
+      shouldPost: false,
       errorMessage: buildHelpText(),
     }
   }
@@ -46,6 +64,7 @@ function parseCommand(rawText) {
 
   return {
     action: 'set',
+    shouldPost,
     statusText: preset.text,
     emoji: preset.emoji,
     channelPhrase: preset.channelPhrase,
@@ -62,7 +81,9 @@ function buildHelpText() {
     '  `/availability meeting 30m`\n' +
     '  `/availability sick today`\n' +
     '  `/availability leaving early at 4pm`\n' +
-    '  `/availability clear`'
+    '  `/availability clear`\n\n' +
+    'Add `post` at the end to also announce in `#availability`:\n' +
+    '  `/availability unavailable 1h post`'
   )
 }
 

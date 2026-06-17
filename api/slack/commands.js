@@ -27,6 +27,7 @@ module.exports = async function handler(req, res) {
   const commandText = params.get('text') || ''
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
+  const responseUrl = params.get('response_url')
 
   const { userToken, userEmail } = await resolveUserToken(slackUserId, slackWorkspaceId)
 
@@ -38,8 +39,12 @@ module.exports = async function handler(req, res) {
     })
   }
 
-  // Process everything synchronously and respond once with the final result.
-  // This avoids the unreliable replace_original / response_url pattern.
+  // Acknowledge Slack immediately (must respond within 3 seconds).
+  // The real work happens below and the result is POSTed to response_url.
+  res.status(200).json({ response_type: 'ephemeral', text: '⏳ Updating your availability…' })
+
+  // Continue processing after the response is sent.
+  // Vercel keeps the function alive until this async handler resolves.
   try {
     const result = await handleCommand({
       commandText,
@@ -50,14 +55,15 @@ module.exports = async function handler(req, res) {
     })
 
     const payload = typeof result === 'string'
-      ? { response_type: 'ephemeral', text: result }
-      : { response_type: 'ephemeral', ...result }
+      ? { response_type: 'ephemeral', replace_original: true, text: result }
+      : { response_type: 'ephemeral', replace_original: true, ...result }
 
-    return res.status(200).json(payload)
+    await postToResponseUrl(responseUrl, payload)
   } catch (err) {
     console.error('Command processing failed:', err)
-    return res.status(200).json({
+    await postToResponseUrl(responseUrl, {
       response_type: 'ephemeral',
+      replace_original: true,
       text: 'Something went wrong updating your availability. Please try again.',
     })
   }
@@ -103,6 +109,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
   let user = null
   let parsed = null
   let channelTs = null
+  let resolvedShouldPost = false
   let hasError = false
   let errorMessage = null
 
@@ -118,6 +125,24 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       return parsed.errorMessage
     }
 
+    // For 'clear', decide whether to post based on the previous status's should_post flag.
+    // For 'set', use the flag from the command itself.
+    let shouldPost = parsed.shouldPost
+    resolvedShouldPost = shouldPost
+    if (parsed.action === 'clear' && !parsed.shouldPost) {
+      const { data: lastLog } = await supabase
+        .from('availability_logs')
+        .select('should_post')
+        .eq('user_id', user.id)
+        .not('status_text', 'is', null)
+        .eq('success', true)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      shouldPost = lastLog?.should_post ?? false
+      resolvedShouldPost = shouldPost
+    }
+
     // Update status in source workspace
     if (parsed.action === 'clear') {
       await clearStatus(userToken)
@@ -129,20 +154,28 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       })
     }
 
-    // Sync to other workspaces + post to #availability in parallel
+    // Sync to other workspaces (always) + conditionally post to #availability
     let syncResults = []
     let channelPostError = null
-    const [syncSettled, channelSettled] = await Promise.allSettled([
+
+    const toSettle = [
       syncToOtherWorkspaces({ email: resolvedEmail, sourceWorkspaceId: slackWorkspaceId, parsed }),
-      postAvailabilityMessage({
-        displayName: user.display_name || slackUserId,
-        avatarUrl: user.avatar_url || null,
-        statusText: parsed.statusText,
-        channelPhrase: parsed.channelPhrase,
-        humanReadable: parsed.humanReadable,
-        action: parsed.action,
-      }),
-    ])
+    ]
+    if (shouldPost) {
+      toSettle.push(
+        postAvailabilityMessage({
+          displayName: user.display_name || slackUserId,
+          avatarUrl: user.avatar_url || null,
+          statusText: parsed.statusText,
+          channelPhrase: parsed.channelPhrase,
+          humanReadable: parsed.humanReadable,
+          action: parsed.action,
+        })
+      )
+    }
+
+    const settled = await Promise.allSettled(toSettle)
+    const [syncSettled, channelSettled] = settled
 
     if (syncSettled.status === 'fulfilled') {
       syncResults = syncSettled.value
@@ -150,14 +183,16 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       console.error('Sync failed:', syncSettled.reason?.message)
     }
 
-    if (channelSettled.status === 'fulfilled') {
-      channelTs = channelSettled.value
-    } else {
-      channelPostError = channelSettled.reason
-      console.error('Failed to post to #availability:', channelSettled.reason?.message)
+    if (shouldPost) {
+      if (channelSettled.status === 'fulfilled') {
+        channelTs = channelSettled.value
+      } else {
+        channelPostError = channelSettled.reason
+        console.error('Failed to post to #availability:', channelSettled.reason?.message)
+      }
     }
 
-    return buildConfirmationMessage({ parsed, syncResults, channelPostError, userEmail: resolvedEmail })
+    return buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, userEmail: resolvedEmail })
 
   } catch (err) {
     hasError = true
@@ -194,6 +229,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       durationMinutes: parsed?.durationMinutes ?? null,
       expiresAt: parsed?.expiresAt ?? null,
       channelTs,
+      shouldPost: resolvedShouldPost,
       success: !hasError,
       errorMessage,
     })
@@ -240,7 +276,7 @@ async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
   })
 }
 
-function buildConfirmationMessage({ parsed, syncResults, channelPostError, userEmail }) {
+function buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, userEmail }) {
   const lines = []
 
   if (parsed.action === 'clear') {
@@ -260,10 +296,12 @@ function buildConfirmationMessage({ parsed, syncResults, channelPostError, userE
     }
   }
 
-  if (channelPostError) {
-    lines.push('⚠️ Could not post to `#availability` — make sure the bot is invited to the channel.')
-  } else if (parsed.action !== 'clear') {
-    lines.push('Posted in: #availability')
+  if (shouldPost) {
+    if (channelPostError) {
+      lines.push('⚠️ Could not post to `#availability` — make sure the bot is invited to the channel.')
+    } else {
+      lines.push('Posted in: #availability')
+    }
   }
 
   return lines.join('\n')
@@ -308,7 +346,7 @@ function verifySlackSignature(headers, rawBody) {
 
 async function logAvailability({
   userId, rawCommand, statusText, statusEmoji,
-  durationMinutes, expiresAt, channelTs, success, errorMessage,
+  durationMinutes, expiresAt, channelTs, shouldPost, success, errorMessage,
 }) {
   try {
     await supabase.from('availability_logs').insert({
@@ -319,6 +357,7 @@ async function logAvailability({
       duration_minutes: durationMinutes ?? null,
       expires_at: expiresAt ? expiresAt.toISOString() : null,
       channel_message_ts: channelTs ?? null,
+      should_post: shouldPost ?? false,
       success: !!success,
       error_message: errorMessage ?? null,
     })
@@ -331,6 +370,19 @@ function formatDuration(minutes) {
   if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60} hour${minutes / 60 !== 1 ? 's' : ''}`
   if (minutes >= 60) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
   return `${minutes} minute${minutes !== 1 ? 's' : ''}`
+}
+
+async function postToResponseUrl(responseUrl, payload) {
+  if (!responseUrl) return
+  try {
+    await fetch(responseUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  } catch (err) {
+    console.error('Failed to POST to response_url:', err.message)
+  }
 }
 
 function buildConnectBlocks(connectUrl) {
