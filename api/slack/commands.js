@@ -42,7 +42,7 @@ module.exports = async function handler(req, res) {
   // Acknowledge Slack immediately (must respond within 3 seconds).
   // Empty body = silent acknowledgment; no visible message is shown to the user.
   // The real result is POSTed to response_url after processing completes.
-  res.status(200).json({})
+  res.status(200).end()
 
   // Continue processing after the response is sent.
   // Vercel keeps the function alive until this async handler resolves.
