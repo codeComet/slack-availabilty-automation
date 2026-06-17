@@ -18,15 +18,30 @@ async function findOrCreateUser({ slackUserId, slackWorkspaceId }) {
     .maybeSingle()
 
   if (selectError) throw selectError
-  if (existing) return existing
+  if (existing) {
+    // Backfill avatar_url if missing (for users created before this column existed)
+    if (!existing.avatar_url) {
+      try {
+        const info = await botClient.users.info({ user: slackUserId })
+        const avatarUrl = info.user?.profile?.image_72 || null
+        if (avatarUrl) {
+          await supabase.from('users').update({ avatar_url: avatarUrl }).eq('id', existing.id)
+          existing.avatar_url = avatarUrl
+        }
+      } catch (_) {}
+    }
+    return existing
+  }
 
-  // New user — fetch display name from Slack
+  // New user — fetch display name, email, and avatar from Slack
   let displayName = slackUserId
   let email = null
+  let avatarUrl = null
   try {
     const info = await botClient.users.info({ user: slackUserId })
     displayName = info.user?.profile?.display_name || info.user?.real_name || slackUserId
     email = info.user?.profile?.email || null
+    avatarUrl = info.user?.profile?.image_72 || null
   } catch (err) {
     console.warn(`Could not fetch Slack user info for ${slackUserId}:`, err.message)
   }
@@ -47,6 +62,7 @@ async function findOrCreateUser({ slackUserId, slackWorkspaceId }) {
           slack_user_id: slackUserId,
           slack_workspace_id: slackWorkspaceId,
           display_name: displayName,
+          avatar_url: avatarUrl,
           updated_at: new Date().toISOString(),
         })
         .eq('email', email)
@@ -63,6 +79,7 @@ async function findOrCreateUser({ slackUserId, slackWorkspaceId }) {
       slack_workspace_id: slackWorkspaceId,
       display_name: displayName,
       email,
+      avatar_url: avatarUrl,
     })
     .select()
     .single()

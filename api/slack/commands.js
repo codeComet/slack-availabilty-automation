@@ -136,6 +136,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       syncToOtherWorkspaces({ email: resolvedEmail, sourceWorkspaceId: slackWorkspaceId, parsed }),
       postAvailabilityMessage({
         displayName: user.display_name || slackUserId,
+        avatarUrl: user.avatar_url || null,
         statusText: parsed.statusText,
         channelPhrase: parsed.channelPhrase,
         humanReadable: parsed.humanReadable,
