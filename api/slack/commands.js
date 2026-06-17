@@ -40,8 +40,9 @@ module.exports = async function handler(req, res) {
   }
 
   // Acknowledge Slack immediately (must respond within 3 seconds).
-  // The real work happens below and the result is POSTed to response_url.
-  res.status(200).json({ response_type: 'ephemeral', text: '⏳ Updating your availability…' })
+  // Empty body = silent acknowledgment; no visible message is shown to the user.
+  // The real result is POSTed to response_url after processing completes.
+  res.status(200).json({})
 
   // Continue processing after the response is sent.
   // Vercel keeps the function alive until this async handler resolves.
@@ -55,15 +56,14 @@ module.exports = async function handler(req, res) {
     })
 
     const payload = typeof result === 'string'
-      ? { response_type: 'ephemeral', replace_original: true, text: result }
-      : { response_type: 'ephemeral', replace_original: true, ...result }
+      ? { response_type: 'ephemeral', text: result }
+      : { response_type: 'ephemeral', ...result }
 
     await postToResponseUrl(responseUrl, payload)
   } catch (err) {
     console.error('Command processing failed:', err)
     await postToResponseUrl(responseUrl, {
       response_type: 'ephemeral',
-      replace_original: true,
       text: 'Something went wrong updating your availability. Please try again.',
     })
   }
