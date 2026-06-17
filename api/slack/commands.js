@@ -27,7 +27,6 @@ module.exports = async function handler(req, res) {
   const commandText = params.get('text') || ''
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
-  const responseUrl = params.get('response_url')
 
   const { userToken, userEmail } = await resolveUserToken(slackUserId, slackWorkspaceId)
 
@@ -39,13 +38,8 @@ module.exports = async function handler(req, res) {
     })
   }
 
-  // Acknowledge Slack immediately (must respond within 3 seconds).
-  // Empty body = silent acknowledgment; no visible message is shown to the user.
-  // The real result is POSTed to response_url after processing completes.
-  res.status(200).end()
-
-  // Continue processing after the response is sent.
-  // Vercel keeps the function alive until this async handler resolves.
+  // Process the command synchronously and respond with the result.
+  // Slack requires a response within 3 seconds — typical execution is well under that.
   try {
     const result = await handleCommand({
       commandText,
@@ -55,14 +49,14 @@ module.exports = async function handler(req, res) {
       userEmail,
     })
 
-    const payload = typeof result === 'string'
+    const responseBody = typeof result === 'string'
       ? { response_type: 'ephemeral', text: result }
       : { response_type: 'ephemeral', ...result }
 
-    await postToResponseUrl(responseUrl, payload)
+    return res.status(200).json(responseBody)
   } catch (err) {
     console.error('Command processing failed:', err)
-    await postToResponseUrl(responseUrl, {
+    return res.status(200).json({
       response_type: 'ephemeral',
       text: 'Something went wrong updating your availability. Please try again.',
     })
@@ -370,19 +364,6 @@ function formatDuration(minutes) {
   if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60} hour${minutes / 60 !== 1 ? 's' : ''}`
   if (minutes >= 60) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
   return `${minutes} minute${minutes !== 1 ? 's' : ''}`
-}
-
-async function postToResponseUrl(responseUrl, payload) {
-  if (!responseUrl) return
-  try {
-    await fetch(responseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-  } catch (err) {
-    console.error('Failed to POST to response_url:', err.message)
-  }
 }
 
 function buildConnectBlocks(connectUrl) {
