@@ -423,3 +423,42 @@ The MVP is successful if:
 - The user receives a clear success/failure confirmation.
 - Manual Slack status changes do not trigger syncing.
 - The system works without a browser extension.
+
+---
+
+## Implementation Decisions (Engineering Notes)
+
+### `post` Flag — Channel Announcement Control
+
+The default behavior is **silent**: `/availability lunch 1h` updates the user's Slack status across workspaces but does NOT post to `#availability`.
+
+To announce, append `post`: `/availability lunch 1h post`
+
+Rules:
+- `post` is detected and stripped from the end of the raw command text in `parseCommand.js` before preset matching.
+- For `/availability clear`: if no `post` flag is given, the system looks up the `should_post` value on the last non-null `availability_logs` entry to decide. If the original status was set with `post`, the clear posts "available again"; otherwise it clears silently.
+- For `/availability clear post`: always posts "available again", regardless of how the original status was set.
+- `availability_logs.should_post` (boolean, default `true`) records per-entry whether the `post` flag was used. Migration `003_add_should_post.sql` applies this column.
+
+### Vercel Serverless Response Pattern — Always Synchronous
+
+**Never use `res.end()` or `res.status(200).end()` as a silent acknowledgment and rely on async work continuing after it.** Vercel terminates the function after the HTTP response is sent; any awaited work after `res.end()` is not guaranteed to run.
+
+The handler in `api/slack/commands.js` processes everything synchronously:
+1. Await `handleCommand()`
+2. Return `res.status(200).json(result)` in one shot
+
+Typical execution is ~300–800ms, well under Slack's 3-second timeout. If execution time becomes a concern for users with many connected workspaces, revisit with Vercel's `waitUntil` API (`@vercel/functions`) rather than a bare two-phase response.
+
+### Supabase Project
+
+Project ID: `knynktkmhweygoapobas`
+URL: `https://knynktkmhweygoapobas.supabase.co`
+
+### DB Migrations Applied
+
+| Migration | Status | Notes |
+| --------- | ------ | ----- |
+| `001_initial_schema.sql` | ✅ Applied | Base `users` and `availability_logs` tables |
+| `002_workspace_connections.sql` | ✅ Applied | Multi-workspace OAuth support |
+| `003_add_should_post.sql` | ✅ Applied | `should_post` column on `availability_logs` |

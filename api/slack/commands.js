@@ -193,6 +193,14 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
     errorMessage = err.message
     console.error('Error handling /availability command:', err)
 
+    // Slack returned operation_timeout — their servers were too slow to process
+    // the profile update.  Don't retry (retries are disabled on getUserClient),
+    // just tell the user to try again in a moment.
+    const slackError = err.data?.error || err.code
+    if (slackError === 'operation_timeout' || err.message?.includes('operation_timeout')) {
+      return 'Slack is taking too long to respond right now. Please try your `/availability` command again in a moment.'
+    }
+
     // Slack API token errors — tell the user to reconnect rather than showing a generic error
     const slackTokenErrors = ['no_user_token', 'invalid_auth', 'token_revoked', 'account_inactive', 'token_expired']
     if (slackTokenErrors.includes(err.data?.error || err.message)) {
