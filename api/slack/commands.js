@@ -151,56 +151,13 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       })
     }
 
-    // ── Google Calendar OOO ──────────────────────────────────────────────────
-    if (parsed.action === 'set' && parsed.calendarDates && resolvedEmail) {
-      const connected = await isGoogleConnected(resolvedEmail)
-      if (!connected) {
-        const connectUrl = `${process.env.APP_URL}/api/google/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
-        calendarResult = { success: false, connectUrl }
-      } else {
-        try {
-          googleCalendarEventId = await createOOOEvent(
-            resolvedEmail,
-            parsed.calendarDates.startDate,
-            parsed.calendarDates.endDate
-          )
-          calendarResult = { success: true }
-        } catch (err) {
-          const detail = err?.response?.data?.error?.message || err.message || 'unknown error'
-          console.error('Google Calendar OOO creation failed:', detail)
-          calendarResult = { success: false, errorMsg: detail }
-        }
-      }
-    }
-
-    if (parsed.action === 'clear' && resolvedEmail) {
-      // Look up the last leave log that has a calendar event ID
-      const { data: lastLeaveLog } = await supabase
-        .from('availability_logs')
-        .select('google_calendar_event_id')
-        .eq('user_id', user.id)
-        .not('google_calendar_event_id', 'is', null)
-        .eq('success', true)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-
-      if (lastLeaveLog?.google_calendar_event_id) {
-        try {
-          await deleteOOOEvent(resolvedEmail, lastLeaveLog.google_calendar_event_id)
-        } catch (err) {
-          console.error('Failed to delete Google Calendar OOO event:', err.message)
-        }
-      }
-    }
-    // ────────────────────────────────────────────────────────────────────────
-
-    // Sync to other workspaces (always) + conditionally post to #availability
+    // ── Run sync + calendar in parallel to stay within Slack's 3s timeout ────
     let syncResults = []
     let channelPostError = null
 
     const toSettle = [
       syncToOtherWorkspaces({ email: resolvedEmail, sourceWorkspaceId: slackWorkspaceId, parsed }),
+      buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWorkspaceId, userId: user.id }),
     ]
     if (shouldPost) {
       toSettle.push(
@@ -216,12 +173,19 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
     }
 
     const settled = await Promise.allSettled(toSettle)
-    const [syncSettled, channelSettled] = settled
+    const [syncSettled, calendarSettled, channelSettled] = settled
 
     if (syncSettled.status === 'fulfilled') {
       syncResults = syncSettled.value
     } else {
       console.error('Sync failed:', syncSettled.reason?.message)
+    }
+
+    if (calendarSettled.status === 'fulfilled' && calendarSettled.value) {
+      calendarResult = calendarSettled.value.calendarResult
+      googleCalendarEventId = calendarSettled.value.googleCalendarEventId ?? null
+    } else if (calendarSettled.status === 'rejected') {
+      console.error('Calendar task failed:', calendarSettled.reason?.message)
     }
 
     if (shouldPost) {
@@ -232,6 +196,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
         console.error('Failed to post to #availability:', channelSettled.reason?.message)
       }
     }
+    // ─────────────────────────────────────────────────────────────────────────
 
     return buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, calendarResult, userEmail: resolvedEmail })
 
@@ -284,6 +249,56 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       errorMessage,
     })
   }
+}
+
+/**
+ * Builds the Google Calendar task for this command invocation.
+ * Returns { calendarResult, googleCalendarEventId } or null if not applicable.
+ */
+async function buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWorkspaceId, userId }) {
+  // Set: create OOO event for leave commands
+  if (parsed.action === 'set' && parsed.calendarDates && resolvedEmail) {
+    const connected = await isGoogleConnected(resolvedEmail)
+    if (!connected) {
+      const connectUrl = `${process.env.APP_URL}/api/google/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
+      return { calendarResult: { success: false, connectUrl }, googleCalendarEventId: null }
+    }
+    try {
+      const eventId = await createOOOEvent(
+        resolvedEmail,
+        parsed.calendarDates.startDate,
+        parsed.calendarDates.endDate
+      )
+      return { calendarResult: { success: true }, googleCalendarEventId: eventId }
+    } catch (err) {
+      const detail = err?.response?.data?.error?.message || err.message || 'unknown error'
+      console.error('Google Calendar OOO creation failed:', detail)
+      return { calendarResult: { success: false, errorMsg: detail }, googleCalendarEventId: null }
+    }
+  }
+
+  // Clear: delete the most recent OOO event if one exists
+  if (parsed.action === 'clear' && resolvedEmail && userId) {
+    const { data: lastLeaveLog } = await supabase
+      .from('availability_logs')
+      .select('google_calendar_event_id')
+      .eq('user_id', userId)
+      .not('google_calendar_event_id', 'is', null)
+      .eq('success', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (lastLeaveLog?.google_calendar_event_id) {
+      try {
+        await deleteOOOEvent(resolvedEmail, lastLeaveLog.google_calendar_event_id)
+      } catch (err) {
+        console.error('Failed to delete Google Calendar OOO event:', err.message)
+      }
+    }
+  }
+
+  return null
 }
 
 async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
