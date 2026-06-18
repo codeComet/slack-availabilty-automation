@@ -349,7 +349,7 @@ function buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPost
     } else if (calendarResult.connectUrl) {
       lines.push(`📅 Google Calendar not connected. <${calendarResult.connectUrl}|Connect your Google account> to sync OOO automatically.`)
     } else {
-      lines.push(`📅 Google Calendar error: ${calendarResult.errorMsg || 'unknown'}`)
+      lines.push('📅 Could not update Google Calendar. Please try again.')
     }
   }
 

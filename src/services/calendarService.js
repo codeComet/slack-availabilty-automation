@@ -66,7 +66,7 @@ async function getGoogleClient(userEmail) {
  *
  * @param {string} userEmail   Company email used to look up stored tokens
  * @param {string} startDate   Inclusive start date, "YYYY-MM-DD"
- * @param {string} endDate     Exclusive end date,   "YYYY-MM-DD"  (Google Calendar convention)
+ * @param {string} endDate     Exclusive end date,   "YYYY-MM-DD"
  * @returns {Promise<string>}  The created event's Google Calendar event ID
  */
 async function createOOOEvent(userEmail, startDate, endDate) {
@@ -75,13 +75,15 @@ async function createOOOEvent(userEmail, startDate, endDate) {
 
   const calendar = google.calendar({ version: 'v3', auth })
 
+  // outOfOffice events require dateTime (not date); use start-of-day → start-of-end-day
+  const timeZone = 'Asia/Dhaka'
   const { data } = await calendar.events.insert({
     calendarId: 'primary',
     requestBody: {
       summary: 'Out of office',
       eventType: 'outOfOffice',
-      start: { date: startDate },
-      end:   { date: endDate },
+      start: { dateTime: `${startDate}T00:00:00`, timeZone },
+      end:   { dateTime: `${endDate}T00:00:00`,   timeZone },
       outOfOfficeProperties: {
         autoDeclineMode: 'declineAllConflictingInvitations',
         declineMessage: 'I am currently out of office and will respond when I return.',
