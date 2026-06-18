@@ -166,8 +166,9 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
           )
           calendarResult = { success: true }
         } catch (err) {
-          console.error('Google Calendar OOO creation failed:', err.message)
-          calendarResult = { success: false, errorMsg: err.message }
+          const detail = err?.response?.data?.error?.message || err.message || 'unknown error'
+          console.error('Google Calendar OOO creation failed:', detail)
+          calendarResult = { success: false, errorMsg: detail }
         }
       }
     }
@@ -348,7 +349,7 @@ function buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPost
     } else if (calendarResult.connectUrl) {
       lines.push(`📅 Google Calendar not connected. <${calendarResult.connectUrl}|Connect your Google account> to sync OOO automatically.`)
     } else {
-      lines.push('📅 Could not update Google Calendar. Please try again or connect at the settings link.')
+      lines.push(`📅 Google Calendar error: ${calendarResult.errorMsg || 'unknown'}`)
     }
   }
 
