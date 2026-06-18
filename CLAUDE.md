@@ -462,3 +462,27 @@ URL: `https://knynktkmhweygoapobas.supabase.co`
 | `001_initial_schema.sql` | ✅ Applied | Base `users` and `availability_logs` tables |
 | `002_workspace_connections.sql` | ✅ Applied | Multi-workspace OAuth support |
 | `003_add_should_post.sql` | ✅ Applied | `should_post` column on `availability_logs` |
+| `004_google_calendar.sql` | ✅ Applied | `google_connections` table + `google_calendar_event_id` column on `availability_logs` |
+
+### Google Calendar Integration
+
+Added in v3. Uses per-user OAuth (each user authorises individually via `/api/google/oauth/start`).
+
+Required env vars: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`.
+
+Google Cloud Console setup:
+1. Create an OAuth 2.0 Client ID (Web application).
+2. Add authorised redirect URI: `https://<vercel-domain>/api/google/oauth/callback`.
+3. Enable the Google Calendar API for the project.
+
+Token storage: `google_connections` table, keyed by `user_email`. Access tokens are auto-refreshed via the `tokens` event on the OAuth2 client; the updated access token is written back to the table.
+
+### Leave Status (`/availability leave`)
+
+New preset added in v3. Supported durations: `today` (default), `tomorrow`, `X days`.
+
+Behaviour:
+- Sets Slack status to "On leave 🌴" with expiry at end of the last leave day.
+- Creates a Google Calendar **Out of Office** all-day event with `autoDeclineMode: declineAllConflictingInvitations`.
+- If Google is not connected, the Slack status is still set and the user receives a connect link in the ephemeral reply.
+- `/availability clear` also deletes the most recent calendar OOO event (looks up `google_calendar_event_id` from `availability_logs`).

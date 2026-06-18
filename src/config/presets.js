@@ -8,6 +8,7 @@ const PRESETS = new Map([
   ['focus',         { text: 'Focus time',    emoji: ':headphones:',           channelPhrase: 'is on focus time' }],
   ['lunch',         { text: 'Lunch',         emoji: ':fork_and_knife:',       channelPhrase: 'is at lunch' }],
   ['meeting',       { text: 'In a meeting',  emoji: ':calendar:',             channelPhrase: 'is in a meeting' }],
+  ['leave',         { text: 'On leave',      emoji: ':palm_tree:',            channelPhrase: 'is on leave' }],
 ])
 
 const PRESET_KEYS = Array.from(PRESETS.keys())

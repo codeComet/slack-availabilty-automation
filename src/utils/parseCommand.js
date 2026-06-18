@@ -1,6 +1,9 @@
 const { PRESETS, PRESET_KEYS } = require('../config/presets')
 const { parseDuration } = require('./parseDuration')
 
+// Timezone used for calendar date calculations — must match parseDuration.js
+const TIMEZONE = 'Asia/Dhaka'
+
 /**
  * Parses the raw text from a /availability slash command.
  *
@@ -60,9 +63,12 @@ function parseCommand(rawText) {
 
   const preset = PRESETS.get(matchedKey)
   const remainder = input.slice(matchedKey.length).trim()
-  const duration = parseDuration(remainder)
 
-  return {
+  // For 'leave', default to 'today' if no duration was given
+  const durationInput = (matchedKey === 'leave' && !remainder) ? 'today' : remainder
+  const duration = parseDuration(durationInput)
+
+  const result = {
     action: 'set',
     shouldPost,
     statusText: preset.text,
@@ -70,21 +76,75 @@ function parseCommand(rawText) {
     channelPhrase: preset.channelPhrase,
     ...duration,
   }
+
+  // Attach Google Calendar date range for the 'leave' preset
+  if (matchedKey === 'leave') {
+    result.calendarDates = parseCalendarDates(durationInput)
+    result.leaveDurationStr = durationInput  // used in confirmation message
+  }
+
+  return result
 }
 
 function buildHelpText() {
   return (
     'Unknown command. Try:\n' +
-    '`/availability [sick|unavailable|focus|lunch|meeting|leaving early|clear] [duration]`\n\n' +
+    '`/availability [sick|unavailable|focus|lunch|meeting|leaving early|leave|clear] [duration]`\n\n' +
     'Examples:\n' +
     '  `/availability unavailable 1h`\n' +
     '  `/availability meeting 30m`\n' +
     '  `/availability sick today`\n' +
     '  `/availability leaving early at 4pm`\n' +
+    '  `/availability leave today` _(sets Slack status + Google Calendar OOO)_\n' +
+    '  `/availability leave tomorrow`\n' +
+    '  `/availability leave 3 days`\n' +
     '  `/availability clear`\n\n' +
     'Add `post` at the end to also announce in `#availability`:\n' +
     '  `/availability unavailable 1h post`'
   )
+}
+
+/**
+ * Computes the Google Calendar OOO date range for a leave command.
+ * Google Calendar uses an *exclusive* end date for all-day events.
+ *
+ * @param {string} input  The duration part of the leave command, e.g. "today", "tomorrow", "3 days"
+ * @returns {{ startDate: string, endDate: string }}  Dates as "YYYY-MM-DD"
+ */
+function parseCalendarDates(input) {
+  const s = (input || 'today').trim().toLowerCase()
+
+  const todayStr = todayInTimezone(TIMEZONE)
+
+  if (s === 'today') {
+    return { startDate: todayStr, endDate: addDays(todayStr, 1) }
+  }
+
+  if (s === 'tomorrow') {
+    const tomorrowStr = addDays(todayStr, 1)
+    return { startDate: tomorrowStr, endDate: addDays(todayStr, 2) }
+  }
+
+  const daysMatch = s.match(/^(\d+)\s*days?$/)
+  if (daysMatch) {
+    const n = parseInt(daysMatch[1], 10)
+    return { startDate: todayStr, endDate: addDays(todayStr, n) }
+  }
+
+  // Fallback
+  return { startDate: todayStr, endDate: addDays(todayStr, 1) }
+}
+
+/** Returns today's date as "YYYY-MM-DD" in the given timezone. */
+function todayInTimezone(tz) {
+  return new Date().toLocaleDateString('sv-SE', { timeZone: tz })
+}
+
+/** Adds `n` days to a "YYYY-MM-DD" string and returns the result as "YYYY-MM-DD". */
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00Z')
+  d.setUTCDate(d.getUTCDate() + n)
+  return d.toISOString().slice(0, 10)
 }
 
 module.exports = { parseCommand }

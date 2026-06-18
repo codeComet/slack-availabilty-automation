@@ -1,6 +1,7 @@
 const crypto = require('crypto')
 const { findOrCreateUser } = require('../../src/services/userService')
 const { updateStatus, clearStatus, postAvailabilityMessage } = require('../../src/services/slackService')
+const { createOOOEvent, deleteOOOEvent, isGoogleConnected } = require('../../src/services/calendarService')
 const { parseCommand } = require('../../src/utils/parseCommand')
 const supabase = require('../../src/lib/supabase')
 
@@ -106,6 +107,8 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
   let resolvedShouldPost = false
   let hasError = false
   let errorMessage = null
+  let googleCalendarEventId = null
+  let calendarResult = null  // { success, connectUrl?, errorMsg? }
 
   try {
     // Get display name (and email if not already known)
@@ -148,6 +151,49 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       })
     }
 
+    // ── Google Calendar OOO ──────────────────────────────────────────────────
+    if (parsed.action === 'set' && parsed.calendarDates && resolvedEmail) {
+      const connected = await isGoogleConnected(resolvedEmail)
+      if (!connected) {
+        const connectUrl = `${process.env.APP_URL}/api/google/oauth/start?slack_user_id=${slackUserId}&team_id=${slackWorkspaceId}`
+        calendarResult = { success: false, connectUrl }
+      } else {
+        try {
+          googleCalendarEventId = await createOOOEvent(
+            resolvedEmail,
+            parsed.calendarDates.startDate,
+            parsed.calendarDates.endDate
+          )
+          calendarResult = { success: true }
+        } catch (err) {
+          console.error('Google Calendar OOO creation failed:', err.message)
+          calendarResult = { success: false, errorMsg: err.message }
+        }
+      }
+    }
+
+    if (parsed.action === 'clear' && resolvedEmail) {
+      // Look up the last leave log that has a calendar event ID
+      const { data: lastLeaveLog } = await supabase
+        .from('availability_logs')
+        .select('google_calendar_event_id')
+        .eq('user_id', user.id)
+        .not('google_calendar_event_id', 'is', null)
+        .eq('success', true)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (lastLeaveLog?.google_calendar_event_id) {
+        try {
+          await deleteOOOEvent(resolvedEmail, lastLeaveLog.google_calendar_event_id)
+        } catch (err) {
+          console.error('Failed to delete Google Calendar OOO event:', err.message)
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     // Sync to other workspaces (always) + conditionally post to #availability
     let syncResults = []
     let channelPostError = null
@@ -186,7 +232,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       }
     }
 
-    return buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, userEmail: resolvedEmail })
+    return buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, calendarResult, userEmail: resolvedEmail })
 
   } catch (err) {
     hasError = true
@@ -232,6 +278,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       expiresAt: parsed?.expiresAt ?? null,
       channelTs,
       shouldPost: resolvedShouldPost,
+      googleCalendarEventId,
       success: !hasError,
       errorMessage,
     })
@@ -278,7 +325,7 @@ async function syncToOtherWorkspaces({ email, sourceWorkspaceId, parsed }) {
   })
 }
 
-function buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, userEmail }) {
+function buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPostError, calendarResult, userEmail }) {
   const lines = []
 
   if (parsed.action === 'clear') {
@@ -286,7 +333,23 @@ function buildConfirmationMessage({ parsed, shouldPost, syncResults, channelPost
   } else {
     lines.push('Your availability has been updated.')
     lines.push(`Status: ${parsed.statusText}${parsed.durationMinutes ? ` for ${formatDuration(parsed.durationMinutes)}` : ''}`)
-    if (parsed.humanReadable) lines.push(`Expected to be back at: ${parsed.humanReadable}`)
+    if (parsed.leaveDurationStr) {
+      // For leave, show the human-friendly duration rather than a time
+      lines.push(`Leave: ${parsed.leaveDurationStr}`)
+    } else if (parsed.humanReadable) {
+      lines.push(`Expected to be back at: ${parsed.humanReadable}`)
+    }
+  }
+
+  // Google Calendar result
+  if (calendarResult) {
+    if (calendarResult.success) {
+      lines.push('📅 Google Calendar set to Out of Office.')
+    } else if (calendarResult.connectUrl) {
+      lines.push(`📅 Google Calendar not connected. <${calendarResult.connectUrl}|Connect your Google account> to sync OOO automatically.`)
+    } else {
+      lines.push('📅 Could not update Google Calendar. Please try again or connect at the settings link.')
+    }
   }
 
   if (syncResults.length > 0) {
@@ -348,7 +411,8 @@ function verifySlackSignature(headers, rawBody) {
 
 async function logAvailability({
   userId, rawCommand, statusText, statusEmoji,
-  durationMinutes, expiresAt, channelTs, shouldPost, success, errorMessage,
+  durationMinutes, expiresAt, channelTs, shouldPost,
+  googleCalendarEventId, success, errorMessage,
 }) {
   try {
     await supabase.from('availability_logs').insert({
@@ -360,6 +424,7 @@ async function logAvailability({
       expires_at: expiresAt ? expiresAt.toISOString() : null,
       channel_message_ts: channelTs ?? null,
       should_post: shouldPost ?? false,
+      google_calendar_event_id: googleCalendarEventId ?? null,
       success: !!success,
       error_message: errorMessage ?? null,
     })

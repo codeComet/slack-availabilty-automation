@@ -29,13 +29,27 @@ function parseDuration(input) {
     return buildResult(minutes, null)
   }
 
-  // today → end of today in Stockholm time
+  // today → end of today in timezone
   if (s === 'today') {
-    const expiresAt = endOfTodayInStockholm()
+    const expiresAt = endOfDayOffset(0)
     return buildResult(null, expiresAt)
   }
 
-  // "at X" or "until X" → parse as a time today in Stockholm
+  // tomorrow → end of tomorrow
+  if (s === 'tomorrow') {
+    const expiresAt = endOfDayOffset(1)
+    return buildResult(null, expiresAt)
+  }
+
+  // X days → end of the last day (e.g. "3 days" = today + 2 days at 23:59)
+  const daysMatch = s.match(/^(\d+)\s*days?$/)
+  if (daysMatch) {
+    const n = parseInt(daysMatch[1], 10)
+    const expiresAt = endOfDayOffset(Math.max(n - 1, 0))
+    return buildResult(null, expiresAt)
+  }
+
+  // "at X" or "until X" → parse as a time today in timezone
   const timeMatch = s.match(/^(?:at|until)\s+(.+)$/)
   if (timeMatch) {
     const expiresAt = parseTodayAtTime(timeMatch[1])
@@ -66,11 +80,23 @@ function buildResult(durationMinutes, explicitExpiry) {
   return { durationMinutes, expiresAt, expiresUnix, humanReadable }
 }
 
-function endOfTodayInStockholm() {
-  // Get today's date string in Stockholm time, then set time to 23:59
-  const nowInStockholm = new Date().toLocaleDateString('sv-SE', { timeZone: TIMEZONE })
-  // nowInStockholm is "YYYY-MM-DD"
-  return new Date(`${nowInStockholm}T23:59:00+06:00`)
+/**
+ * Returns a Date representing 23:59 at the end of today + `offsetDays` days,
+ * expressed in the configured timezone.
+ *
+ * We first get today's date string *in the target timezone* (avoiding UTC-offset surprises),
+ * then do pure calendar arithmetic on that string so day boundaries are always correct.
+ *
+ * @param {number} offsetDays  0 = today, 1 = tomorrow, 2 = day after tomorrow, …
+ */
+function endOfDayOffset(offsetDays) {
+  // Step 1: today's date in TIMEZONE (e.g. "2026-06-18")
+  const todayStr = new Date().toLocaleDateString('sv-SE', { timeZone: TIMEZONE })
+  // Step 2: add offset using UTC arithmetic on the date string (no DST ambiguity)
+  const base = new Date(todayStr + 'T00:00:00Z')
+  base.setUTCDate(base.getUTCDate() + offsetDays)
+  const targetStr = base.toISOString().slice(0, 10) // "YYYY-MM-DD"
+  return new Date(`${targetStr}T23:59:00+06:00`)
 }
 
 function parseTodayAtTime(timeStr) {
