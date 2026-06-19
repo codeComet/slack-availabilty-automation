@@ -1,4 +1,5 @@
 const crypto = require('crypto')
+const { waitUntil } = require('@vercel/functions')
 const { findOrCreateUser } = require('../../src/services/userService')
 const { updateStatus, clearStatus, postAvailabilityMessage } = require('../../src/services/slackService')
 const { createOOOEvent, deleteOOOEvent, isGoogleConnected } = require('../../src/services/calendarService')
@@ -28,6 +29,7 @@ module.exports = async function handler(req, res) {
   const commandText = params.get('text') || ''
   const slackUserId = params.get('user_id')
   const slackWorkspaceId = params.get('team_id')
+  const responseUrl = params.get('response_url')
 
   const { userToken, userEmail } = await resolveUserToken(slackUserId, slackWorkspaceId)
 
@@ -39,28 +41,42 @@ module.exports = async function handler(req, res) {
     })
   }
 
-  // Process the command synchronously and respond with the result.
-  // Slack requires a response within 3 seconds — typical execution is well under that.
+  // Acknowledge Slack immediately — Slack requires a 200 within 3 seconds.
+  // All slow work (Slack API, Google Calendar, DB writes) runs in waitUntil,
+  // which keeps the Vercel function alive after the response is sent.
+  // The final result is posted back to Slack via response_url.
+  res.status(200).json({
+    response_type: 'ephemeral',
+    text: '⏳ Updating your availability…',
+  })
+
+  waitUntil(
+    handleCommand({ commandText, slackUserId, slackWorkspaceId, userToken, userEmail })
+      .then(result => postToResponseUrl(responseUrl, result))
+      .catch(err => {
+        console.error('Command processing failed:', err)
+        return postToResponseUrl(responseUrl, 'Something went wrong updating your availability. Please try again.')
+      })
+  )
+}
+
+/**
+ * Posts the final command result to Slack's response_url.
+ * This replaces the "⏳ Updating…" acknowledgement with the real outcome.
+ */
+async function postToResponseUrl(responseUrl, result) {
+  if (!responseUrl) return
+  const body = typeof result === 'string'
+    ? { response_type: 'ephemeral', replace_original: true, text: result }
+    : { response_type: 'ephemeral', replace_original: true, ...result }
   try {
-    const result = await handleCommand({
-      commandText,
-      slackUserId,
-      slackWorkspaceId,
-      userToken,
-      userEmail,
+    await fetch(responseUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     })
-
-    const responseBody = typeof result === 'string'
-      ? { response_type: 'ephemeral', text: result }
-      : { response_type: 'ephemeral', ...result }
-
-    return res.status(200).json(responseBody)
   } catch (err) {
-    console.error('Command processing failed:', err)
-    return res.status(200).json({
-      response_type: 'ephemeral',
-      text: 'Something went wrong updating your availability. Please try again.',
-    })
+    console.error('Failed to post to response_url:', err.message)
   }
 }
 
@@ -122,27 +138,31 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
       return parsed.errorMessage
     }
 
-    // For 'clear', decide whether to post based on the previous status's should_post flag.
-    // For 'set', use the flag from the command itself.
     let shouldPost = parsed.shouldPost
     resolvedShouldPost = shouldPost
-    if (parsed.action === 'clear' && !parsed.shouldPost) {
-      const { data: lastLog } = await supabase
-        .from('availability_logs')
-        .select('should_post')
-        .eq('user_id', user.id)
-        .not('status_text', 'is', null)
-        .eq('success', true)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-      shouldPost = lastLog?.should_post ?? false
-      resolvedShouldPost = shouldPost
-    }
 
-    // Update status in source workspace
+    // For 'clear': fetch the last log (should_post + calendar event ID) AND update
+    // the Slack status at the same time — eliminates a sequential DB round trip.
+    // For 'set': just update the status.
+    let lastClearLog = null
     if (parsed.action === 'clear') {
-      await clearStatus(userToken)
+      const [, lastLogResult] = await Promise.all([
+        clearStatus(userToken),
+        supabase
+          .from('availability_logs')
+          .select('should_post, google_calendar_event_id')
+          .eq('user_id', user.id)
+          .not('status_text', 'is', null)
+          .eq('success', true)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ])
+      lastClearLog = lastLogResult.data
+      if (!parsed.shouldPost) {
+        shouldPost = lastClearLog?.should_post ?? false
+        resolvedShouldPost = shouldPost
+      }
     } else {
       await updateStatus(userToken, {
         statusText: parsed.statusText,
@@ -157,7 +177,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
 
     const toSettle = [
       syncToOtherWorkspaces({ email: resolvedEmail, sourceWorkspaceId: slackWorkspaceId, parsed }),
-      buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWorkspaceId, userId: user.id }),
+      buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWorkspaceId, lastCalendarEventId: lastClearLog?.google_calendar_event_id }),
     ]
     if (shouldPost) {
       toSettle.push(
@@ -205,12 +225,11 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
     errorMessage = err.message
     console.error('Error handling /availability command:', err)
 
-    // Slack returned operation_timeout — their servers were too slow to process
-    // the profile update.  Don't retry (retries are disabled on getUserClient),
-    // just tell the user to try again in a moment.
+    // Slack's profile update API returned operation_timeout — retries are disabled
+    // so we won't make it worse. Tell the user to try again.
     const slackError = err.data?.error || err.code
     if (slackError === 'operation_timeout' || err.message?.includes('operation_timeout')) {
-      return 'Slack is taking too long to respond right now. Please try your `/availability` command again in a moment.'
+      return "Slack's status API timed out. Please try your `/availability` command again in a moment."
     }
 
     // Slack API token errors — tell the user to reconnect rather than showing a generic error
@@ -255,7 +274,7 @@ async function handleCommand({ commandText, slackUserId, slackWorkspaceId, userT
  * Builds the Google Calendar task for this command invocation.
  * Returns { calendarResult, googleCalendarEventId } or null if not applicable.
  */
-async function buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWorkspaceId, userId }) {
+async function buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWorkspaceId, lastCalendarEventId }) {
   // Set: create OOO event for leave commands
   if (parsed.action === 'set' && parsed.calendarDates && resolvedEmail) {
     const connected = await isGoogleConnected(resolvedEmail)
@@ -277,24 +296,12 @@ async function buildCalendarTask({ parsed, resolvedEmail, slackUserId, slackWork
     }
   }
 
-  // Clear: delete the most recent OOO event if one exists
-  if (parsed.action === 'clear' && resolvedEmail && userId) {
-    const { data: lastLeaveLog } = await supabase
-      .from('availability_logs')
-      .select('google_calendar_event_id')
-      .eq('user_id', userId)
-      .not('google_calendar_event_id', 'is', null)
-      .eq('success', true)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
-
-    if (lastLeaveLog?.google_calendar_event_id) {
-      try {
-        await deleteOOOEvent(resolvedEmail, lastLeaveLog.google_calendar_event_id)
-      } catch (err) {
-        console.error('Failed to delete Google Calendar OOO event:', err.message)
-      }
+  // Clear: delete the OOO event whose ID was passed in (already fetched alongside clearStatus)
+  if (parsed.action === 'clear' && resolvedEmail && lastCalendarEventId) {
+    try {
+      await deleteOOOEvent(resolvedEmail, lastCalendarEventId)
+    } catch (err) {
+      console.error('Failed to delete Google Calendar OOO event:', err.message)
     }
   }
 
